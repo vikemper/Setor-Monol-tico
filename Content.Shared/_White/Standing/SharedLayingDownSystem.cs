@@ -2,13 +2,16 @@ using Content.Shared.DoAfter;
 using Content.Shared.Gravity;
 using Content.Shared.Input;
 using Content.Shared.Mobs.Systems;
+using Content.Shared.Movement.Components;
 using Content.Shared.Movement.Systems;
 using Content.Shared.Standing;
 using Content.Shared.Stunnable;
 using Content.Shared.Traits.Assorted; //Mono: Wheelchair user check
 using Robust.Shared.Input.Binding;
+using Robust.Shared.Physics.Components;
 using Robust.Shared.Player;
 using Robust.Shared.Serialization;
+using Robust.Shared.Timing;
 
 namespace Content.Shared._White.Standing;
 
@@ -18,6 +21,8 @@ public abstract partial class SharedLayingDownSystem : EntitySystem
     [Dependency] private StandingStateSystem _standing = default!;
     [Dependency] private SharedDoAfterSystem _doAfter = default!;
     [Dependency] private SharedGravitySystem _gravity = default!;
+    [Dependency] private MovementSpeedModifierSystem _movementSpeed = default!;
+    [Dependency] private IGameTiming _timing = default!;
     public override void Initialize()
     {
         CommandBinds.Builder
@@ -77,10 +82,21 @@ public abstract partial class SharedLayingDownSystem : EntitySystem
         if (HasComp<KnockedDownComponent>(uid) || !_mobState.IsAlive(uid))
             return;
 
-        if (_standing.IsDown(uid, standing))
+        if (layingDown.IsSliding && _standing.IsDown(uid, standing))
+        {
+            if (!_standing.Stand(uid, standing, force: true))
+                return;
+
+            StopSlide(uid, layingDown, TimeSpan.FromSeconds(5));
+        }
+        else if (_standing.IsDown(uid, standing))
             TryStandUp(uid, layingDown, standing);
-        else
-            TryLieDown(uid, layingDown, standing);
+        else if (TryLieDown(uid, layingDown, standing) &&
+                 _timing.CurTime >= layingDown.SlideCooldownEndsAt &&
+                 IsRunning(uid))
+        {
+            StartSlide(uid, layingDown);
+        }
     }
 
     private void OnStandingUpDoAfter(EntityUid uid, StandingStateComponent component, StandingUpDoAfterEvent args)
@@ -98,9 +114,59 @@ public abstract partial class SharedLayingDownSystem : EntitySystem
     private void OnRefreshMovementSpeed(EntityUid uid, LayingDownComponent component, RefreshMovementSpeedModifiersEvent args)
     {
         if (_standing.IsDown(uid))
-            args.ModifySpeed(component.SpeedModify, component.SpeedModify);
+        {
+            var modifier = component.IsSliding ? component.SlideSpeedModifier : component.SpeedModify;
+            args.ModifySpeed(modifier, modifier);
+        }
         else
             args.ModifySpeed(1f, 1f);
+    }
+
+    private bool IsRunning(EntityUid uid)
+    {
+        if (!TryComp(uid, out InputMoverComponent? mover) ||
+            !TryComp(uid, out MovementSpeedModifierComponent? movementSpeed) ||
+            !TryComp(uid, out PhysicsComponent? physics))
+        {
+            return false;
+        }
+
+        const MoveButtons movementButtons = MoveButtons.Up | MoveButtons.Down | MoveButtons.Left | MoveButtons.Right;
+        if ((mover.HeldMoveButtons & movementButtons) == MoveButtons.None ||
+            physics.LinearVelocity.LengthSquared() < 0.25f)
+        {
+            return false;
+        }
+
+        var walkSpeed = movementSpeed.CurrentWalkSpeed;
+        var sprintSpeed = movementSpeed.CurrentSprintSpeed;
+        return mover.Sprinting ? sprintSpeed > walkSpeed : walkSpeed > sprintSpeed;
+    }
+
+    private void StartSlide(EntityUid uid, LayingDownComponent component)
+    {
+        component.IsSliding = true;
+        component.SlideCooldownEndsAt = _timing.CurTime + TimeSpan.FromSeconds(3);
+        Dirty(uid, component);
+        _movementSpeed.RefreshMovementSpeedModifiers(uid);
+    }
+
+    private void StopSlide(EntityUid uid, LayingDownComponent component, TimeSpan cooldown)
+    {
+        component.IsSliding = false;
+        component.SlideCooldownEndsAt = _timing.CurTime + cooldown;
+        Dirty(uid, component);
+        _movementSpeed.RefreshMovementSpeedModifiers(uid);
+    }
+
+    protected void EndSlide(EntityUid uid, LayingDownComponent component)
+    {
+        if (!component.IsSliding)
+            return;
+
+        component.IsSliding = false;
+        Dirty(uid, component);
+        _movementSpeed.RefreshMovementSpeedModifiers(uid);
     }
 
     // Mono edit
